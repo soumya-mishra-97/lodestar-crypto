@@ -1,0 +1,86 @@
+# Local full stack: Postgres, Redis, API, Celery worker + beat, web.  `make up` -> http://localhost:8080
+# Without API keys everything runs in demo mode (synthetic data, visible banner, deterministic agents).
+name: lodestar
+
+x-backend: &backend
+  build: ./backend
+  env_file:
+    - path: .env
+      required: false   # `make up` works on a fresh clone; copy .env.example to .env to configure keys
+  environment:
+    LS_DATABASE_URL: postgresql+asyncpg://lodestar:${POSTGRES_PASSWORD:-lodestar}@db:5432/lodestar
+    LS_REDIS_URL: redis://:${REDIS_PASSWORD:-lodestar}@redis:6379/0
+  depends_on:
+    db: { condition: service_healthy }
+    redis: { condition: service_healthy }
+  restart: unless-stopped
+  read_only: true
+  tmpfs: [/tmp]
+  security_opt: ["no-new-privileges:true"]
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: lodestar
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lodestar}
+      POSTGRES_DB: lodestar
+    volumes: [pgdata:/var/lib/postgresql/data]
+    ports: ["127.0.0.1:5432:5432"]   # loopback only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lodestar"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-lodestar}", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction", "--appendonly", "yes"]
+    volumes: [redisdata:/data]
+    ports: ["127.0.0.1:6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-lodestar}", "--no-auth-warning", "ping"]
+      interval: 5s
+      retries: 10
+
+  # One-shot: schema migrations, LangGraph checkpoint tables, first-run seed (demo watchlist, holdings, reports).
+  migrate:
+    <<: *backend
+    command: ["sh", "-c", "alembic upgrade head && python -m lodestar.interfaces.cli seed"]
+    restart: "no"
+    healthcheck: { disable: true }
+
+  api:
+    <<: *backend
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    ports: ["127.0.0.1:8000:8000"]
+
+  # Solo pool: one async pipeline at a time per process. Scale with `docker compose up --scale worker=3`.
+  worker:
+    <<: *backend
+    command: ["celery", "-A", "lodestar.interfaces.workers.tasks", "worker", "--pool=solo", "--loglevel=INFO"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "celery", "-A", "lodestar.interfaces.workers.tasks", "inspect", "ping", "--timeout", "5"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+
+  # Daily reports at LS_DAILY_REPORT_HOUR_UTC (default 06:00 UTC) for every watchlisted coin.
+  beat:
+    <<: *backend
+    command: ["celery", "-A", "lodestar.interfaces.workers.tasks", "beat", "--loglevel=INFO", "--schedule", "/tmp/celerybeat-schedule"]
+    healthcheck: { disable: true }
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  web:
+    build: ./frontend
+    depends_on: [api]
+    ports: ["127.0.0.1:8080:8080"]
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
